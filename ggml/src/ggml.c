@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-amx.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -18013,8 +18014,14 @@ static int ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+    const bool use_amx = src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && ne11 >= 8 && ne00 >= 32 && (ne00 % 32) == 0 &&
+        ne12 == ne02 && ne13 == ne03 &&
+        (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) &&
+        ggml_amx_available();
+
 #if GGML_USE_IQK_MULMAT
-    if (dst->type == GGML_TYPE_F32) {
+    if (!use_amx && dst->type == GGML_TYPE_F32) {
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,
@@ -18046,12 +18053,15 @@ static int ggml_compute_forward_mul_mat(
 #endif
         }
         else {
+            // the AMX kernels consume plain q8_0 rows
+            ggml_from_float_t const from_float_q80 = use_amx ?
+                type_traits[GGML_TYPE_Q8_0].from_float : from_float;
 
             for (int64_t i13 = 0; i13 < ne13; ++i13) {
                 for (int64_t i12 = 0; i12 < ne12; ++i12) {
                     int64_t i11_processed = 0;
 #if !GGML_USE_IQK_MULMAT
-                    if ((ggml_n_dims(src1) == 2) && from_float_to_mat && gemm) {
+                    if (!use_amx && (ggml_n_dims(src1) == 2) && from_float_to_mat && gemm) {
                         for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
                             from_float_to_mat((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                                     (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
@@ -18061,7 +18071,7 @@ static int ggml_compute_forward_mul_mat(
                     }
 #endif
                     for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                        from_float_q80((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                                 (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                                 ne10);
                     }
@@ -18079,6 +18089,19 @@ static int ggml_compute_forward_mul_mat(
     }
 
     const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+
+    if (use_amx) {
+        const size_t nbw1 = ggml_row_size(GGML_TYPE_Q8_0, ne10);
+        if (ggml_amx_mul_mat_4d(type,
+                    ne01, ne11, ne00,
+                    ne02, ne03, ne12, ne13, nb02, nb03,
+                    nbw1*ne11, nbw1*ne11*ne12, nb2, nb3,
+                    src0->data, nb01,
+                    wdata, nbw1,
+                    (float *)dst->data, nb1/sizeof(float), ith, nth)) {
+            return node_n;
+        }
+    }
 
     if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);

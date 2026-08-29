@@ -1326,6 +1326,31 @@ endif()
 
 # ggml
 
+# compiled on all platforms; contains the AMX kernels when the compiler
+# supports the required flags, a runtime-disabled stub otherwise
+set(GGML_SOURCES_AMX ggml-amx.cpp)
+set(GGML_HEADERS_AMX ggml-amx.h)
+if (GGML_AMX_INT8 AND NOT MSVC AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i686"))
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS "-mamx-tile -mamx-int8 -mamx-bf16 -mavx512f -mavx512bw -mf16c -mfma")
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        int main() {
+            _tile_loadd(1, 0, 64);
+            _tile_dpbssd(2, 1, 3);
+            _tile_dpbf16ps(4, 2, 0);
+            return 0;
+        }" COMPILER_SUPPORTS_AMX_INT8)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if (COMPILER_SUPPORTS_AMX_INT8)
+        set_source_files_properties(ggml-amx.cpp PROPERTIES
+            COMPILE_OPTIONS "-mamx-tile;-mamx-int8;-mamx-bf16;-mavx512f;-mavx512bw;-mf16c;-mfma")
+        message(STATUS "AMX-INT8 support detected, ggml-amx.cpp will use AMX kernels")
+    else()
+        message(STATUS "AMX-INT8 not supported by the compiler, ggml-amx.cpp compiled as a stub")
+    endif()
+endif()
+
 add_library(ggml
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -1351,6 +1376,7 @@ add_library(ggml
             ${GGML_SOURCES_IQK}       ${GGML_HEADERS_IQK}
             ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
             ggml-aarch64.c            ggml-aarch64.h
+            ${GGML_SOURCES_AMX}       ${GGML_HEADERS_AMX}
             )
 
 if (EMSCRIPTEN)
